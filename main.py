@@ -1,74 +1,77 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Depends, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.requests import Request
-from typing import List, Dict, Optional
+
+from sqlalchemy.orm import Session
+
+from typing import Optional, List
+from contextlib import asynccontextmanager
 import uvicorn
 
-app = FastAPI()
-
-products: List[Dict[str, str]] = [
-    {"name": "Товар 1", "category": "Электроника", "price": 100, "brand": "Бренд A"},
-    {"name": "Товар 2", "category": "Косметика", "price": 150, "brand": "Бренд B"},
-    {"name": "Товар 3", "category": "Косметика", "price": 50, "brand": "Бренд A"},
-    {"name": "Товар 4", "category": "Одежда", "price": 70, "brand": "Бренд C"},
-    {"name": "Товар 5", "category": "Электроника", "price": 120, "brand": "Бренд A"},
-    {"name": "Товар 6", "category": "Одежда", "price": 80, "brand": "Бренд B"},
-    {"name": "Товар 7", "category": "Косметика", "price": 90, "brand": "Бренд C"},
-    {"name": "Товар 8", "category": "Электроника", "price": 130, "brand": "Бренд A"},
-    {"name": "Товар 9", "category": "Одежда", "price": 100, "brand": "Бренд B"},
-    {"name": "Товар 10", "category": "Косметика", "price": 110, "brand": "Бренд C"},
-    {"name": "Товар 11", "category": "Электроника", "price": 120, "brand": "Бренд A"},
-    {"name": "Товар 12", "category": "Одежда", "price": 130, "brand": "Бренд B"},
-    {"name": "Товар 13", "category": "Одежда", "price": 140, "brand": "Бренд C"},
-    {"name": "Товар 14", "category": "Косметика", "price": 150, "brand": "Бренд A"},
-    {"name": "Товар 15", "category": "Одежда", "price": 160, "brand": "Бренд B"},
-    {"name": "Товар 16", "category": "Электроника", "price": 170, "brand": "Бренд C"},
-]
+from db import Product, SessionLocal, init_db, seed_data
 
 templates = Jinja2Templates(directory="templates")
 
-def filter_products(products: List[Dict[str, str]],
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    seed_data()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def filter_products_query(
+    db: Session,
     name: Optional[str],
     category: Optional[str],
     price_min: Optional[str],
     price_max: Optional[str],
-    brand: Optional[str]) -> List[Dict[str, str]]:
+    brand: Optional[str]) -> List[Product]:
 
-    filtered_products = []
+    query = db.query(Product)
 
-    for product in products:
-        match_found = True
+    if name: query = query.filter(Product.name.ilike(f"%{name}%"))
+    if category: query = query.filter(Product.category.ilike(f"%{category}%"))
+    if brand: query = query.filter(Product.brand.ilike(f"%{brand}%"))
 
-        if name and name.lower() not in product['name'].lower(): match_found = False
-        if category and category.lower() not in product['category'].lower(): match_found = False
-        if price_min:
-            try:
-                price_min_value = int(price_min)
-                if product['price'] < price_min_value: match_found = False
-            except ValueError: match_found = False
+    if price_min:
+        try:
+            price_min_value = int(price_min)
+            query = query.filter(Product.price >= price_min_value)
+        except ValueError: pass
 
-        if price_max:
-            try:
-                price_max_value = int(price_max)
-                if product['price'] > price_max_value:
-                    match_found = False
-            except ValueError: match_found = False
-        if brand and brand.lower() not in product['brand'].lower(): match_found = False
-        if match_found: filtered_products.append(product)
-    return filtered_products
+    if price_max:
+        try:
+            price_max_value = int(price_max)
+            query = query.filter(Product.price <= price_max_value)
+        except ValueError: pass
 
-def paginate_products(products: List[Dict[str, str]], page: int, size: int) -> List[Dict[str, str]]:
-    start = (page - 1) * size
-    end = start + size
-    return products[start:end]
+    return query
+
+
+def paginate_query(query, page: int, size: int): return query.offset((page - 1) * size).limit(size).all()
+
 
 @app.get("/", response_class=HTMLResponse)
-async def read_products(request: Request, page: int = 1, size: int = 5):
+async def read_products(request: Request, page: int = 1, size: int = 5, db: Session = Depends(get_db)):
+    query = db.query(Product)
+    paginated = paginate_query(query, page, size)
+    return templates.TemplateResponse("list.html",
+        {"request": request,
+        "products": paginated,
+        "page": page,
+        "size": size})
 
-    paginated_products = paginate_products(products, page, size)
-
-    return templates.TemplateResponse("list.html", {"request": request, "products": paginated_products, "page": page, "size": size})
 
 @app.get("/search", response_class=HTMLResponse)
 async def search_products(request: Request,
@@ -77,19 +80,16 @@ async def search_products(request: Request,
     price_min: Optional[str] = Query(None),
     price_max: Optional[str] = Query(None),
     brand: Optional[str] = Query(None),
-    page: int = 1,
-    size: int = 5):
+    page: int = 1, size: int = 5,
+    db: Session = Depends(get_db)):
+    query = filter_products_query(db, name, category, price_min, price_max, brand)
+    paginated = paginate_query(query, page, size)
+    return templates.TemplateResponse("list.html", 
+        {"request": request,
+        "products": paginated,
+        "page": page,
+        "size": size})
 
-    filtered_products = filter_products(products, name, category, price_min, price_max, brand)
-
-    paginated_products = paginate_products(filtered_products, page, size)
-
-    return templates.TemplateResponse("list.html", {"request": request, "products": paginated_products, "page": page, "size": size})
 
 if __name__ == '__main__':
     uvicorn.run(app, host="127.0.0.1", port=8000)
-
-
-
-
-
